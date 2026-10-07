@@ -1,3 +1,13 @@
+# 文件导读：仓库根目录的命令行对话入口，支持原生权重、LoRA 与 Transformers 模型。
+# 输入人工问题或示例问题；输出流式文本及可选端到端 token/s，不做训练。
+# 运行须准备 tokenizer 和匹配权重；historys 按消息条数截取，通常问答两条为一轮。
+# 阅读 main 的路径配置/历史/模板，再读 init_model；生成原理见 model/model_minimind.py。
+# 自回归（Autoregressive）逐 token 预测，每步使用提示及已生成内容。
+# token 是分词器编号；B=批大小，P=提示 token 数，R=新增 token 数，完整输出为 [B,P+R]。
+# LoRA（Low-Rank Adaptation，低秩适配）训练增量矩阵，MoE（Mixture of Experts，混合专家）选少量前馈专家。
+# RoPE（Rotary Position Embedding，旋转位置编码）给注意力注入位置；改变位置表不保证长文本质量。
+# temperature 以 logits/温度调分布尖锐程度，top-p 保留累计概率达到阈值的候选再采样。
+# eval 关闭训练态随机失活，no_grad/inference_mode 关闭梯度记录；二者分别控制不同事情。
 import time
 import argparse
 import random
@@ -9,8 +19,14 @@ from model.model_lora import *
 from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
+# 按 args.load_from 加载 tokenizer 与模型，返回 (半精度、eval、指定设备模型, tokenizer)。
+# 路径包含字符串 model 时走原生 .pth 分支（不是精确目录名判断），结构须匹配权重。
+# 否则走 Transformers 自动类，trust_remote_code=True 可执行模型目录中的自定义代码。
+# eval 关闭 dropout 等训练行为，不等于 no_grad；此处统一 half，CPU 也走半精度。
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    # 原生分支由 CLI 构造 config，再 strict=True 加载；层数/宽度/MoE 或词表不匹配会报错。
+    # LoRA 若启用，需先注入同结构再加载 A/B；不是读取适配器就能替代基模。
     if 'model' in args.load_from:
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
@@ -29,7 +45,11 @@ def init_model(args):
     get_model_params(model, model.config)
     return model.half().eval().to(args.device), tokenizer
 
+# 解析 CLI、加载模型，循环生成并追加 assistant 回答；返回 None，打印输出。
+# 预训练模式拼 BOS+裸问题，对话模式套模板；随机种子每问重新随机选择。
+# 手动输入空串结束；参数与输出目录以仓库根目录为基准。
 def main():
+    # 选项控制起始权重、模型形状、思考开关、历史和采样；不会自动寻找缺失数据/权重。
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
     parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
@@ -64,34 +84,44 @@ def main():
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
+    # iter(callable, sentinel) 每次调用 input，遇空串停止；自动模式遍历固定列表。
+    # 这里的 lambda 无参数，只读一条问题，不做模型推理。
     prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
     for prompt in prompt_iter:
         setup_seed(random.randint(0, 31415926))
         if input_mode == 0: print(f'💬: {prompt}')
+        # historys=0 显式清空；否则保留末尾 N 条消息（不是 N 轮），再追加当前问题。
         conversation = conversation[-args.historys:] if args.historys else []
         conversation.append({"role": "user", "content": prompt})
         if 'pretrain' in args.weight:
             inputs = tokenizer.bos_token + prompt
         else:
+            # 聊天模板（Chat Template）把 messages 的角色与边界转为模型训练过的文本协议。
+            # add_generation_prompt 为待生成助手加前缀；tools 只声明工具，不在模型内部执行函数。
             inputs = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
         
         inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
 
         print('🧠: ', end='')
         st = time.time()
+        # 输入 [1,P]；max_new_tokens 限新增步数，返回 [1,P+R]，包含原提示。
+        # 温度缩放改变尖锐程度，top_p 保留累积概率阈值内候选再采样；具体本地算法见 generate。
         generated_ids = model.generate(
             inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
         )
+        # 按提示 token 数切掉前 P 个 ID，避免把问题再次当回答；跳过特殊 token 后入历史。
         response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
         conversation.append({"role": "assistant", "content": response})
+        # 分母从 generate 前开始，含提示计算/采样/流式输出开销，不是纯 GPU decode 内核基准。
         gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
         print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
 
 if __name__ == "__main__":
     try:
         main()
+    # 仅捕获用户结束输入/中断，模型加载与运行异常仍传播。
     except (EOFError, KeyboardInterrupt):
         print()

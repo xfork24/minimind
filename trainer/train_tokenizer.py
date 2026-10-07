@@ -1,3 +1,9 @@
+# 文件导读：学习字节级 BPE（Byte Pair Encoding，字节对编码）并导出 Transformers 分词器。
+# BPE 从字节字符表出发，反复合并高频相邻单元；token ID 需与模型嵌入行一一对应。
+# JSONL 是每行一个 JSON 对象；BOS/EOS 标记序列边界，PAD 补齐长度，UNK 表示未知单元。
+# 从 trainer 目录执行会读取 JSONL 并写 model_learn_tokenizer，主入口先训练再评估。
+# 已有权重绑定原词表，不可随意换新词表；阅读 get_texts→train_tokenizer→eval_tokenizer。
+# 此文件只训练文本编码器，不训练大模型，也不赋予模型多模态能力。
 # 注：不建议再重复训练tokenizer（“词典”），MiniMind已自带，此脚本仅供学习和参考。基于不同词典训练的模型将导致输出完全不统一，降低社区的模型复用性
 # Note: It is not recommended to re-train the tokenizer. MiniMind already includes one. This script is for learning and reference only. Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
 import os
@@ -10,6 +16,9 @@ VOCAB_SIZE = 6400
 SPECIAL_TOKENS_NUM = 36
 MAX_LINES = 0  # 0 表示读取全部；设为正数则只取前 N 条（快速试跑）
 
+# 生成器逐行产出非空文本，兼容 text 或 conversations；max_lines 计有效样本而非物理行。
+# 坏 JSON 跳过，UTF-8 解码错误忽略；格式不符/字段类型不符未必自动容错。
+# 没有有效文本则抛 ValueError，防止仅凭初始字母表产生没有语料合并的词表。
 def get_texts(data_path, max_lines=MAX_LINES):
     """逐行产出用于训练 BPE 的文本，兼容两种主线数据格式。
 
@@ -42,10 +51,16 @@ def get_texts(data_path, max_lines=MAX_LINES):
             f'继续训练只会得到一个空词表。'
         )
 
+# 输入语料路径、输出目录、词表与预留 token 数；训练 BPE 并写 JSON/vocab/merges/config。
+# 无梯度与神经优化器；合并统计决定子词表，输出文件可被 AutoTokenizer 读取。
+# 特殊 token 顺序决定其编号；数量太小不能凭 buffer 自动删掉已有协议 token。
 def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPECIAL_TOKENS_NUM):
     tokenizer = Tokenizer(models.BPE())
+    # 字节级预切分覆盖任意 UTF-8 文本，add_prefix_space=False 不自动补前导空格。
+    # 一个汉字可跨多个 token，单个 token 解码不一定是完整 Unicode 字符。
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     
+    # 基础边界及多模态名字只作为保留符号；普通语言模型并未在此获得图像/音频网络。
     special_tokens_list = [
         "<|endoftext|>", "<|im_start|>", "<|im_end|>", 
         "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", 
@@ -53,6 +68,7 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         "<|audio_start|>", "<|audio_end|>", "<|audio_pad|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>", "<tts_text_bos_single>"
     ]
     
+    # 工具与思考标记预留固定编号；稍后将其 special=False，避免 skip_special_tokens 抹掉协议内容。
     additional_tokens_list = [
         "<tool_call>", "</tool_call>",
         "<tool_response>", "</tool_response>",
@@ -61,6 +77,8 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
     num_buffer = special_tokens_num - len(special_tokens_list + additional_tokens_list)
     buffer_tokens = [f"<|buffer{i}|>" for i in range(1, num_buffer + 1)] # 预留一定数量的token位置
     all_special_tokens = special_tokens_list + additional_tokens_list + buffer_tokens
+    # initial_alphabet 包含完整字节字符表；vocab_size 是目标总词表大小，包括保留 token。
+    # 从 iterator 逐条消费文本，避免一次拼接整份语料。
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         show_progress=True,
@@ -78,6 +96,8 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
     tokenizer_json_path = os.path.join(tokenizer_dir, "tokenizer.json")
     with open(tokenizer_json_path, 'r', encoding='utf-8') as f:
         tokenizer_data = json.load(f)
+    # 只保留基础列表为 special；buffer/think/tool 在 JSON 中设为普通 added token。
+    # “具有独立编号”与“解码时作为特殊 token 跳过”是两个属性。
     for token_info in tokenizer_data.get('added_tokens', []):
         if token_info['content'] not in special_tokens_list:
             token_info['special'] = False
@@ -96,6 +116,9 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
             "special": True if token in special_tokens_list else False
         }
 
+    # 配置声明 BOS/EOS/PAD/UNK 与快分词器类；不自动添加 BOS/EOS，由聊天模板显式安排边界。
+    # 下面嵌入 Jinja 模板原样保存：渲染角色、工具 schema、调用/响应及 think 前缀。
+    # 工具观察按 user 协议包装；open_thinking 控制待生成助手前缀，不代表强制正确推理。
     config = {
         "add_bos_token": False,
         "add_eos_token": False,
@@ -126,6 +149,8 @@ def train_tokenizer(data_path, tokenizer_dir, vocab_size, special_tokens_num=SPE
         json.dump(config, f, ensure_ascii=False, indent=4)
     print("Tokenizer training completed.")
 
+# 加载刚导出的分词器，显示聊天模板、编码解码一致性、字符/token 比与字节缓冲解码。
+# 只做示例检查，不代表下游模型质量；字符/token 不是文件压缩字节比。
 def eval_tokenizer(tokenizer_dir):
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
@@ -166,6 +191,7 @@ def eval_tokenizer(tokenizer_dir):
         encoded = tokenizer.encode(text)
         token_count = len(encoded)
         char_count = len(text)
+        # len(text)/len(encoded) 衡量每 token 平均字符数；更大不必然使模型更好。
         compression_ratio = char_count / token_count
         total_compression += compression_ratio
         print(f"样本 {i+1} | 字符数: {char_count:4} | Tokens: {token_count:3} | 压缩率: {compression_ratio:.2f}")
@@ -178,12 +204,15 @@ def eval_tokenizer(tokenizer_dir):
     for tid in input_ids:
         token_cache.append(tid)
         current_decode = tokenizer.decode(token_cache)
+        # U+FFFD 表示可能尚缺字节；继续缓存 IDs，直到可完整解码再输出并清空。
+        # 这是教学示例缓冲法，不是神经网络 KV cache。
         if current_decode and '\ufffd' not in current_decode:
             display_ids = token_cache[0] if len(token_cache) == 1 else token_cache
             raw_tokens = [tokenizer.convert_ids_to_tokens(int(t)) for t in (token_cache if isinstance(token_cache, list) else [token_cache])]
             print(f'Token ID: {str(display_ids):15} -> Raw: {str(raw_tokens):20} -> Decode Str: {current_decode}')
             token_cache = []
 
+# 直接执行会训练并落盘，随后做演示评估；仅语法验证不会触发这些操作。
 if __name__ == '__main__':
     train_tokenizer(DATA_PATH, TOKENIZER_DIR, VOCAB_SIZE)
     eval_tokenizer(TOKENIZER_DIR)

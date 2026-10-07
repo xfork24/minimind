@@ -1,3 +1,13 @@
+# 文件导读：FastAPI 包装本地 MiniMind 生成，提供 /v1/chat/completions 兼容接口。
+# 输入消息/采样参数/工具声明，输出完整 JSON 或 SSE（Server-Sent Events，服务端事件流）。
+# 宿主只生成 tool_calls，不执行工具；调用方需要自行执行并带结果再次请求。
+# 从 scripts 目录启动，准备匹配权重；全局 model/tokenizer 在 __main__ 初始化。
+# 先读 ChatRequest→chat_completions→流式线程/队列；示例未提供生产认证或并发资源调度。
+# token 是分词器编号；B=批大小，P=提示 token 数，R=新增 token 数，完整输出为 [B,P+R]。
+# LoRA（Low-Rank Adaptation，低秩适配）训练增量矩阵，MoE（Mixture of Experts，混合专家）选少量前馈专家。
+# RoPE（Rotary Position Embedding，旋转位置编码）给注意力注入位置；改变位置表不保证长文本质量。
+# temperature 以 logits/温度调分布尖锐程度，top-p 保留累计概率达到阈值的候选再采样。
+# eval 关闭训练态随机失活，no_grad/inference_mode 关闭梯度记录；二者分别控制不同事情。
 import argparse
 import json
 import re
@@ -25,8 +35,14 @@ warnings.filterwarnings('ignore')
 app = FastAPI()
 
 
+# 按 args.load_from 加载 tokenizer 与模型，返回 (半精度、eval、指定设备模型, tokenizer)。
+# 路径包含字符串 model 时走原生 .pth 分支（不是精确目录名判断），结构须匹配权重。
+# 否则走 Transformers 自动类，trust_remote_code=True 可执行模型目录中的自定义代码。
+# eval 关闭 dropout 等训练行为，不等于 no_grad；此处统一 half，CPU 也走半精度。
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    # 原生分支由 CLI 构造 config，再 strict=True 加载；层数/宽度/MoE 或词表不匹配会报错。
+    # LoRA 若启用，需先注入同结构再加载 A/B；不是读取适配器就能替代基模。
     if 'model' in args.load_from:
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
@@ -47,6 +63,8 @@ def init_model(args):
     return model.half().eval().to(device), tokenizer
 
 
+# Pydantic 请求模型，对基础字段解析与默认值赋值；messages/tools 内部仅声明为 list。
+# 未限制温度范围、消息角色 schema 或最大并发；model 名字不会在这里动态加载不同权重。
 class ChatRequest(BaseModel):
     model: str
     messages: list
@@ -58,6 +76,8 @@ class ChatRequest(BaseModel):
     open_thinking: bool = False
     chat_template_kwargs: dict = None
     
+    # 优先显式 open_thinking，再兼容模板 kwargs 的 open_thinking/enable_thinking。
+    # 返回开关值，不修改模型；False 不会否定 kwargs 中的 True。
     def get_open_thinking(self) -> bool:
         """兼容多种方式开启 thinking"""
         if self.open_thinking:
@@ -68,18 +88,25 @@ class ChatRequest(BaseModel):
         return False
 
 
+# 继承 TextStreamer，把完成的文本片段送到线程安全队列，让 HTTP 消费者逐段读取。
+# 跳过原提示与特殊 token；流式文本片段不一定是一整个 token。
 class CustomStreamer(TextStreamer):
+    # 初始化父类解码行为，保存 tokenizer 与调用方 Queue；无独立模型。
     def __init__(self, tokenizer, queue):
         super().__init__(tokenizer, skip_prompt=True, skip_special_tokens=True)
         self.queue = queue
         self.tokenizer = tokenizer
 
+    # 回调把 text 入队，结束时再入 None 哨兵；消费者据此结束，不把 None 当文本。
     def on_finalized_text(self, text: str, stream_end: bool = False):
         self.queue.put(text)
         if stream_end:
             self.queue.put(None)
 
 
+# 分离思考区、普通正文与工具调用，返回 (content,reasoning_content,tool_calls或None)。
+# 无起始 think 但有闭合标签时把前段当思考；工具参数编码成 API JSON 字符串。
+# 正则/JSON 解析失败忽略对应调用，不验证工具允许列表。
 def parse_response(text):
     reasoning_content = None
     think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
@@ -102,14 +129,22 @@ def parse_response(text):
     return text.strip(), reasoning_content, tool_calls or None
 
 
+# 生成器渲染 prompt 并开生成线程，从队列读取增量，yield JSON 字符串。
+# emitted 是已发送字符偏移，full_text 是累计文本；最后集中解析工具调用并发 finish_reason。
+# 思考开关影响增量分类；异常以 error JSON 输出，不直接更新 HTTP 状态码。
 def generate_stream_response(messages, temperature, top_p, max_tokens, tools=None, open_thinking=False):
     try:
+        # 聊天模板（Chat Template）把 messages 的角色与边界转为模型训练过的文本协议。
+        # add_generation_prompt 为待生成助手加前缀；tools 只声明工具，不在模型内部执行函数。
         new_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools or None, open_thinking=open_thinking)
         inputs = tokenizer(new_prompt, return_tensors="pt", truncation=True).to(device)
 
+        # 生产者为 generate 线程，消费者为 SSE 迭代器；队列无容量上限，慢客户端可能积压。
         queue = Queue()
         streamer = CustomStreamer(tokenizer, queue)
 
+        # 闭包读取 inputs/model/queue，线程内调用 generate；异常入 error 再入结束哨兵。
+        # 无梯度优化；线程生成与 HTTP 读取解耦，但未实现客户端断连的取消控制。
         def _generate():
             try:
                 model.generate(
@@ -143,6 +178,8 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
             full_text += text
 
             if not thinking_ended:
+                # 寻找完整 </think> 后切换字段；检测前会立即发送所有未发字符。
+                # 结束标签若跨片段到达，前半标签可能已作为思考增量发出，非完整标签缓存解析器。
                 pos = full_text.find('</think>')
                 if pos >= 0:
                     thinking_ended = True
@@ -166,6 +203,7 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
                     yield json.dumps({"choices": [{"delta": {"content": new_c}}]}, ensure_ascii=False)
                     emitted = len(full_text)
 
+        # 普通文本可能已经流出工具标签；结束时再附结构化调用，不等于只发送其中一种格式。
         _, _, tool_calls = parse_response(full_text)
         if tool_calls:
             yield json.dumps({"choices": [{"delta": {"tool_calls": tool_calls}}]}, ensure_ascii=False)
@@ -175,11 +213,15 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
         yield json.dumps({"error": str(e)})
 
 
+# POST 处理器读取请求，流式返回 StreamingResponse，非流式同步生成完整回答。
+# 非流式 no_grad，切掉提示 IDs，再拆 thinking/tools；异常转 HTTPException。
+# async 声明不意味着同步模型计算自动不阻塞事件循环；此例未做并发隔离。
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
     try:
         if request.stream:
             return StreamingResponse(
+                # SSE 每事件以 data: 开头、空行结尾；这里发送 finish_reason，但未另发送 [DONE] 哨兵。
                 (f"data: {chunk}\n\n" for chunk in generate_stream_response(
                     messages=request.messages,
                     temperature=request.temperature,
@@ -191,6 +233,8 @@ async def chat_completions(request: ChatRequest):
                 media_type="text/event-stream"
             )
         else:
+            # 聊天模板（Chat Template）把 messages 的角色与边界转为模型训练过的文本协议。
+            # add_generation_prompt 为待生成助手加前缀；tools 只声明工具，不在模型内部执行函数。
             new_prompt = tokenizer.apply_chat_template(
                 request.messages,
                 tokenize=False,
@@ -249,4 +293,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     device = args.device
     model, tokenizer = init_model(args)
+    # 监听所有网卡的 8998 端口；示例无身份认证，部署前须自行限制暴露与请求资源。
     uvicorn.run(app, host="0.0.0.0", port=8998)
