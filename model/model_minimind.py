@@ -26,12 +26,21 @@ class MiniMindConfig(PretrainedConfig):
     # 注意 head_dim 应为偶数，H 应能被 K 整除；本实现不显式检查这些前提。
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         super().__init__(**kwargs)
+        # hidden_size：隐藏层宽度 D，所有子层输入/输出向量的统一维度，决定模型体格。
+        # num_hidden_layers：Transformer 块堆叠层数，越深表达越强、训练越慢。
+        # use_moe：是否把普通 FFN 换成 MoE（混合专家）层，见下方 MoE 配置。
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.use_moe = use_moe
         self.dropout = kwargs.get("dropout", 0.0)
         # dropout（随机失活）在训练中随机置零部分激活并缩放保留值，降低过拟合。
         # eval 模式关掉模块的随机失活；默认概率 0 表示本模型通常无此随机性。
+        # vocab_size：词表大小，embedding 矩阵行数 = lm_head 输出维度，决定能表示多少个 token。
+        # bos/eos_token_id：起始/终止符编号；编码时以 <s> 开头，生成时采样到 </s> 即停止。
+        # flash_attn：True 且条件满足时走 PyTorch SDPA（FlashAttention 内核），更快更省显存；否则退回手写注意力。
+        # num_attention_heads：查询头数量 Q；num_key_value_heads：KV 头数量 K，K<Q 即 GQA，多个查询头共享一组 K/V。
+        # head_dim：每头宽度 = hidden_size / Q（见上：须为偶数且 Q 能被 K 整除）。
+        # hidden_act：FFN 激活函数，silu 即 SwiGLU 门控用的 SiLU（x·sigmoid(x)）。
         self.vocab_size = kwargs.get("vocab_size", 6400)
         self.bos_token_id = kwargs.get("bos_token_id", 1)
         self.eos_token_id = kwargs.get("eos_token_id", 2)
@@ -42,10 +51,15 @@ class MiniMindConfig(PretrainedConfig):
         self.hidden_act = kwargs.get("hidden_act", 'silu')
         # 中间宽度取约 pi*D 并向上对齐 64，便于矩阵运算；不是序列最大长度。
         self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        # max_position_embeddings：RoPE 预计算表覆盖的最大位置数，即模型支持的最大上下文长度。
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        # rms_norm_eps：RMSNorm 分母 sqrt(mean(x²)+eps) 里的稳定项，防除零；太大偏移归一化尺度。
         self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        # rope_theta：RoPE 基频 base（θ_i = base^(-2i/d)），越大低频分量越多，长距离建模与外推越强。
         self.rope_theta = kwargs.get("rope_theta", 1e6)
+        # tie_word_embeddings：True 时输入 embedding 与输出 lm_head 共享同一权重矩阵，省 vocab*D 参数。
         self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        # inference_rope_scaling：YaRN 外推开关，True 时下方 rope_scaling 生效（2048 训练长度外推到 32k）。
         self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
         # YaRN（Yet another RoPE extensioN）按频段混合原频率与缩小后的频率。
         # 此处 factor=16、original_max=2048；以实际配置为准，不把命令行帮助的倍数当实现。
@@ -63,7 +77,9 @@ class MiniMindConfig(PretrainedConfig):
         # router_aux_loss_coef 仅调均衡项权重，不是优化器学习率。
         self.num_experts = kwargs.get("num_experts", 4)
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        # moe_intermediate_size：每个专家 FFN 的中间宽度，默认与稠密 intermediate_size 一致。
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        # norm_topk_prob：True 时把 Top-K 门控权重归一化（和为 1），专家输出按权重比例合并。
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
