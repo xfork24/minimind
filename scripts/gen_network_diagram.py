@@ -7,7 +7,7 @@
     .venv/bin/python scripts/gen_network_diagram.py --png /tmp/p.png    # 附 PNG 预览
 
 内容分三节:
-  ① 整体结构 MiniMindForCausalLM: embedding → dropout → ×N 层 Block
+  ① 整体结构 MiniMindForCausalLM: embedding → dropout → ×N_trans 层 Block
      （input_layernorm → Attention → ⊕残差 → post_attention_layernorm →
        FeedForward → ⊕残差）→ 最终 RMSNorm → lm_head → logits → softmax/采样
   ② Attention 内部: 投影/RMSNorm/RoPE/KV 缓存/多头 GQA 分组/注意力核心七步
@@ -66,113 +66,122 @@ NODES = {
     "EMB": ("para", ["embed_tokens:", "Embedding(T, D)", r"参数 $[T, D]$",
                      "one-hot 选择行（等价查表）"]),
     "HID": ("rect", [r"hidden_states: $[B, L, D]$"]),
-    "EDROP": ("para", [r"dropout: Dropout($P_{dropout}$)"]),
+    "EDROP": ("para", [r"embedding_dropout: Dropout($P_{dropout}$)"]),
     "HID2": ("rect", [r"hidden_states: $[B, L, D]$", "（Block 输入 / 残差源）"]),
-    "LN1": ("para", ["input_layernorm:", r"RMSNorm(D), 参数 $[D]$"]),
+    "LN1": ("para", ["input_layernorm:", r"RMSNorm(D), 参数 $[D]$",
+                     r"$w \cdot \dfrac{x}{\sqrt{\mathrm{mean}(x^2)+\varepsilon}}$"]),
     "XA": ("rect", [r"x: $[B, L, D]$"]),
     "ATTNREF": ("para", ["self_attn: Attention", "（内部展开见 ②）",
                          r"输出 $[B, L, D]$"]),
     "ADD1": ("circ", ["+"]),
     "H1": ("rect", [r"hidden_states: $[B, L, D]$", "（残差相加后）"]),
-    "LN2": ("para", ["post_attention_layernorm:", r"RMSNorm(D), 参数 $[D]$"]),
+    "LN2": ("para", ["post_attention_layernorm:", r"RMSNorm(D), 参数 $[D]$",
+                     r"$w \cdot \dfrac{x}{\sqrt{\mathrm{mean}(x^2)+\varepsilon}}$"]),
     "XF": ("rect", [r"x: $[B, L, D]$"]),
     "FFNREF": ("para", ["mlp: FeedForward（SwiGLU）", "或 MOEFeedForward",
                         "（内部展开见 ③）", r"输出 $[B, L, D]$"]),
     "ADD2": ("circ", ["+"]),
     "H2": ("rect", [r"hidden_states: $[B, L, D]$", "MiniMindBlock 输出"]),
-    "FNORM": ("para", ["norm: RMSNorm(D)", r"参数 $[D]$, 最终归一化"]),
-    "LMHEAD": ("para", ["lm_head: Linear", r"参数 $[T, D]$, $D \to T$",
-                        "（与 embed_tokens 权重共享）"]),
+    "FNORM": ("para", ["norm: RMSNorm(D)", r"参数 $[D]$, 最终归一化",
+                       r"$w \cdot \dfrac{x}{\sqrt{\mathrm{mean}(x^2)+\varepsilon}}$"]),
+    "LMHEAD": ("para", ["lm_head: Linear",
+                        r"参数 $[D, T]$（线性变换语义 in×out）",
+                        r"$D \to T$（与 embed_tokens 共享权重, 存储 $[T, D]$）"]),
     "LOGITS": ("rect", [r"logits: $[B, L, T]$", "未归一化分数"]),
-    "PROBN": ("para", [r"softmax → probs: $[B, T]$",
-                       "temperature / top-p / top-k 采样",
-                       "（generate 阶段, 逐 token）"]),
-    "NEXTT": ("rect", [r"next_token: $[B, 1]$",
-                       "（采样自 probs, 追加到",
-                       "input_ids 循环生成, 直至 EOS）"]),
+    "PROBN": ("para", ["softmax → probs",
+                       r"训练 $[B, L, T]$: 逐位置分布,",
+                       "与 labels $[B, L]$ 交叉熵（错位一位）",
+                       r"推理 $[B, T]$: 尾位置分布,",
+                       "temperature / top-p / top-k 采样"]),
+    "NEXTT": ("rect", [r"next_token: 训练 $[B, L]$ / 推理 $[B, 1]$",
+                       "训练: 每个位置并行预测下一个 token;",
+                       "推理: 采样一个, 追加到 input_ids 循环"]),
 
     # ---------- ② Attention 内部 ----------
     "XIN": ("rect", [r"x: $[B, L, D]$",
                      "（= ① 中 input_layernorm 的输出）"]),
     "PE": ("rect", ["position_embeddings", "= (cos, sin)",
-                    r"各 $[L, d]$, 由 RoPE 缓冲区", "[max_pos, d]", "按 start_pos 切片"]),
-    "PASTK": ("rect", [r"past_k: $[B, C_0, K, d]$", "推理期历史 KV 缓存"]),
-    "PASTV": ("rect", [r"past_v: $[B, C_0, K, d]$"]),
-    "MASK": ("rect", [r"attention_mask: $[B, C]$", "1=可见, 0=填充", "（可选输入）"]),
-    "QP": ("para", ["q_proj: Linear", r"参数 $[H \cdot d, D]$", r"$D \to H \cdot d$",
-                    "view 拆头"]),
-    "KP": ("para", ["k_proj: Linear", r"参数 $[K \cdot d, D]$", r"$D \to K \cdot d$",
-                    "view 拆头"]),
-    "VP": ("para", ["v_proj: Linear", r"参数 $[K \cdot d, D]$", r"$D \to K \cdot d$",
-                    "view 拆头"]),
-    "XQ": ("rect", [r"xq: $[B, L, H, d]$"]),
-    "XK": ("rect", [r"xk: $[B, L, K, d]$"]),
-    "XV": ("rect", [r"xv: $[B, L, K, d]$", "不做 RMSNorm、不做 RoPE"]),
-    "QN": ("para", ["q_norm: RMSNorm(d)", r"参数 $[d]$", "逐头归一化最后一维",
-                    r"$w \cdot x \cdot \mathrm{rsqrt}(\mathrm{mean}(x^2)+\mathrm{eps})$",
+                    r"各 $[L, d_q]$（$= d_k$, 代码同维）",
+                    "[max_pos, d_q]", "按 start_pos 切片"]),
+    "PASTK": ("rect", [r"past_k: $[B, C, h_k, d_k]$", "旧 KV 缓存（已缓存 C 个位置）"]),
+    "PASTV": ("rect", [r"past_v: $[B, C, h_k, d_k]$"]),
+    "MASK": ("rect", [r"attention_mask: $[B, L]$", "1=可见, 0=填充", "（可选输入）"]),
+    "QP": ("para", ["q_proj: Linear", r"参数 $[D,\ h_q \cdot d_q]$",
+                    r"$D \to h_q \cdot d_q$", "view 拆头"]),
+    "KP": ("para", ["k_proj: Linear", r"参数 $[D,\ h_k \cdot d_k]$",
+                    r"$D \to h_k \cdot d_k$", "view 拆头"]),
+    "VP": ("para", ["v_proj: Linear", r"参数 $[D,\ h_k \cdot d_k]$",
+                    r"$D \to h_k \cdot d_k$", "view 拆头"]),
+    "XQ": ("rect", [r"xq: $[B, L, h_q, d_q]$"]),
+    "XK": ("rect", [r"xk: $[B, L, h_k, d_k]$"]),
+    "XV": ("rect", [r"xv: $[B, L, h_k, d_k]$", "不做 RMSNorm、不做 RoPE"]),
+    "QN": ("para", ["q_norm: RMSNorm(d_q)", r"参数 $[d_q]$", "逐头归一化最后一维",
+                    r"$w \cdot \dfrac{x}{\sqrt{\mathrm{mean}(x^2)+\varepsilon}}$",
                     "float32 计算后还原 dtype"]),
-    "KN": ("para", ["k_norm: RMSNorm(d)", r"参数 $[d]$", "逐头归一化最后一维"]),
-    "XQ2": ("rect", [r"xq: $[B, L, H, d]$"]),
-    "XK2": ("rect", [r"xk: $[B, L, K, d]$"]),
+    "KN": ("para", ["k_norm: RMSNorm(d_k)", r"参数 $[d_k]$", "逐头归一化最后一维",
+                    r"$w \cdot \dfrac{x}{\sqrt{\mathrm{mean}(x^2)+\varepsilon}}$",
+                    "float32 计算后还原 dtype"]),
+    "XQ2": ("rect", [r"xq: $[B, L, h_q, d_q]$"]),
+    "XK2": ("rect", [r"xk: $[B, L, h_k, d_k]$"]),
     "ROPE": ("para", ["RoPE: apply_rotary_pos_emb", "（仅 Q/K）",
                       r"$q \cdot \mathrm{cos} +$ rotate_half(q) $\cdot \mathrm{sin}$",
-                      "（K 同理）", r"cos/sin: $[L, d] \to [L, 1, d]$", "广播到各头"]),
-    "XQ3": ("rect", [r"xq: $[B, L, H, d]$"]),
-    "XK3": ("rect", [r"xk: $[B, L, K, d]$"]),
-    "KVCAT": ("para", ["KV 缓存拼接", "（仅推理且 past_key_value 非空;",
-                       r"无缓存时直通 $C = L$）",
-                       "xk = torch.cat([past_k, xk], dim=1)",
-                       "xv = torch.cat([past_v, xv], dim=1)"]),
-    "XK4": ("rect", [r"xk: $[B, C, K, d]$", r"$C = C_0 + L$"]),
-    "XV2": ("rect", [r"xv: $[B, C, K, d]$"]),
-    "PASTKV": ("rect", ["past_kv = (xk, xv)", r"$[B, C, K, d]$",
-                        "use_cache=True 时返回", "（未复制头的 K/V）"]),
+                      "（K 同理）", r"cos/sin: $[L, d_q] \to [L, 1, d_q]$",
+                      "广播到各头（$d_q = d_k$）"]),
+    "XQ3": ("rect", [r"xq: $[B, L, h_q, d_q]$"]),
+    "XK3": ("rect", [r"xk: $[B, L, h_k, d_k]$"]),
+    "KVCAT": ("para", [
+        "KV 缓存更新（增量推理; 训练时同步写入, C = L）",
+        "xk = torch.cat([past_k, xk], dim=1):",
+        "[B, C, h_k, d_k] + [B, L−C, h_k, d_k] → [B, L, h_k, d_k]",
+        "xv 同理; 先 RoPE 后拼接, 避免历史位置重复旋转",
+    ]),
+    "XK4": ("rect", [r"xk: $[B, L, h_k, d_k]$", "（缓存更新后 C = L）"]),
+    "XV2": ("rect", [r"xv: $[B, L, h_k, d_k]$"]),
+    "PASTKV": ("rect", ["past_kv = (xk, xv)", r"$[B, L, h_k, d_k]$",
+                        "use_cache=True 时返回", "（更新后的 KV 缓存, 长度 = L）"]),
     "GQAP": ("gqa", []),
     "ATTN": ("para", [
         "Attention 核心计算",
-        "① repeat_kv: 复制 K/V 头",
-        r"$N_{rep} = H \div K$ 次,",
-        r"对齐为 $[B, H, L, d]$",
-        r"与 $[B, H, C, d]$",
-        r"② scores $= xq \cdot xk^{\top} \div \sqrt{d}$（对 H 个头并行独立）",
-        r"$\to [B, H, L, C]$（float32）",
-        r"③ + 因果掩码: 最后 $L$ 个键列",
-        r"加 $[L, L]$ 上三角 $-\infty$",
-        "④ + padding 遮罩:",
-        r"$(1-\mathrm{mask}) \cdot (-10^{9})$",
-        r"$[B, C] \to [B, 1, 1, C]$ 广播",
-        "⑤ softmax(dim=-1),",
-        r"再 attn_dropout($P_{dropout}$)",
-        r"⑥ attn @ xv $\to [B, H, L, d]$",
-        "⑦ 合并 H 个头: transpose(1,2)",
-        r"+ reshape $\to [B, L, H \cdot d]$",
-        "（②–⑥ 满足条件时由",
-        "F.scaled_dot_product_attention",
-        "is_causal=True 一步融合:",
-        r"flash 且 $L > 1$ 且无缓存",
-        "且无 padding）",
+        "（训练视角: L = 上下文长度, C = L）",
+        "① repeat_kv: K/V 复制 h_q/h_k 倍,",
+        "xq [B, h_q, L, d_q]; xk/xv [B, h_q, L, d_k]",
+        r"② scores = $xq \cdot xk^{\top} / \sqrt{d_k}$（$h_q$ 个头并行）",
+        "→ [B, h_q, L, L]（float32 计算）",
+        r"③ 因果掩码: [L, L] 上三角 −inf",
+        r"④ padding 遮罩: (1−mask)·(−10⁹),",
+        "mask [B, L] → [B, 1, 1, L] 广播",
+        "⑤ softmax(dim=-1) → attn [B, h_q, L, L]",
+        r"⑥ attn_dropout(P_dropout)（仅训练）",
+        "⑦ attn · xv → [B, h_q, L, d_k]",
+        r"⑧ 合并头: transpose + reshape → [B, L, h_q·d_k]",
+        "──────────────────",
+        "②–⑦ 可由 F.scaled_dot_product_attention",
+        "一步融合（is_causal=True）: 需 flash=True、",
+        "L>1、无 KV 缓存、mask 为空或全 1",
+        "（增量推理: 查询仅新增 L−C 个, 见 KV 缓存更新块）",
     ]),
-    "OUTH": ("rect", [r"output: $[B, L, H \cdot d]$"]),
-    "OP": ("para", ["o_proj: Linear", r"参数 $[D, H \cdot d]$", r"$H \cdot d \to D$"]),
+    "OUTH": ("rect", [r"output: $[B, L, h_q \cdot d_k]$"]),
+    "OP": ("para", ["o_proj: Linear", r"参数 $[h_q \cdot d_k,\ D]$",
+                    r"$h_q \cdot d_k \to D$"]),
     "RDR": ("para", ["resid_dropout:", r"Dropout($P_{dropout}$)"]),
     "OUT": ("rect", [r"output: $[B, L, D]$", "（回到 ① 的 ⊕ 残差相加）"]),
     "RET": ("rect", ["返回 (output, past_kv)"]),
 
     # ---------- ③ FeedForward / MoE ----------
     "FFIN": ("rect", [r"x: $[B, L, D]$", "（post_attention_layernorm 输出）"]),
-    "GP": ("para", ["gate_proj: Linear", r"参数 $[I, D]$", r"$D \to I$"]),
-    "UP": ("para", ["up_proj: Linear", r"参数 $[I, D]$", r"$D \to I$"]),
+    "GP": ("para", ["gate_proj: Linear", r"参数 $[D, I]$", r"$D \to I$"]),
+    "UP": ("para", ["up_proj: Linear", r"参数 $[D, I]$", r"$D \to I$"]),
     "GACT": ("para", ["SiLU(gate)", r"$z \cdot \mathrm{sigmoid}(z)$"]),
     "MUL": ("circ", ["×"]),
     "HMID": ("rect", [r"h: $[B, L, I]$", r"$I$ = intermediate_size",
                       r"（默认 $\lceil D\pi/64 \rceil \cdot 64 = 2432$）"]),
-    "DP": ("para", ["down_proj: Linear", r"参数 $[D, I]$", r"$I \to D$"]),
+    "DP": ("para", ["down_proj: Linear", r"参数 $[I, D]$", r"$I \to D$"]),
     "FFOUT": ("rect", [r"output: $[B, L, D]$"]),
     "MOEX": ("rect", [r"x_flat: $[B \cdot L, D]$"]),
-    "MOEG": ("para", ["gate: Linear", r"参数 $[E, D]$, $D \to E$"]),
+    "MOEG": ("para", ["gate: Linear", r"参数 $[D, E]$, $D \to E$"]),
     "MOESC": ("rect", [r"scores: $[B \cdot L, E]$", "softmax(dim=-1)"]),
     "MOETK": ("para", ["top-k（k=1）+ 权重归一化", "norm_topk_prob 直通估计"]),
-    "MOEEX": ("para", ["专家 $e_1 \\dots e_E$（E=4）", "每个 = FeedForward(SwiGLU)",
+    "MOEEX": ("para", [r"专家 $e_1 \dots e_E$（E=4）", "每个 = FeedForward(SwiGLU)",
                        "仅执行被选中 token"]),
     "MOESUM": ("circ", ["Σ"]),
     "MOEOUT": ("rect", [r"y: $[B, L, D]$"]),
@@ -245,7 +254,7 @@ EDGES = [
     # ① 残差跳连与层循环（正交旁路折线, 不穿组件）
     ("HID2", "ADD1", 0, ("left", 0.5), ("left", 0.5), "残差 1", "bypassL:60"),
     ("H1", "ADD2", 0, ("right", 0.5), ("right", 0.5), "残差 2", "bypassR:60"),
-    ("H2", "HID2", 1, ("left", 0.5), ("left", 0.5), "×N=8 层循环", "bypassL:150"),
+    ("H2", "HID2", 1, ("left", 0.5), ("left", 0.5), "×$N_{trans}$=8 层循环", "bypassL:150"),
     # ② 投影与归一化
     ("QP", "XQ", 0, None, None, None, None),
     ("KP", "XK", 0, None, None, None, None),
@@ -274,9 +283,6 @@ EDGES = [
     ("MASK", "ATTN", 1, ("left", 0.5), ("right", 0.5), "非空时", None),
     ("XK4", "PASTKV", 1, ("top", 0.5), ("top", 0.25), None, "topch"),
     ("XV2", "PASTKV", 1, ("right", 0.7), ("left", 0.7), None, None),
-    ("XQ", "GQAP", 1, ("top", 0.5), ("top", 0.2), None, "topch"),
-    ("XK", "GQAP", 1, ("top", 0.5), ("top", 0.5), None, "topch"),
-    ("XV", "GQAP", 1, ("right", 0.5), ("left", 0.5), None, None),
     # ② 绕行折线（dropin: 下行 → 沿目标上方通道 → 垂直入顶）
     ("XV", "KVCAT", 0, None, None, None, "dropin:0.75"),
     ("XQ3", "ATTN", 0, None, None, None, "dropin:0.2"),
@@ -302,7 +308,7 @@ EDGES = [
     ("MOESUM", "MOEAUX", 1, ("right", 0.5), ("left", 0.5), None, "bypassR:40"),
 ]
 
-TITLE = "MiniMind 完整网络结构图（Embedding → ×N Block → lm_head）"
+TITLE = "MiniMind 完整网络结构图（Embedding → ×$N_{trans}$ Block → lm_head）"
 
 
 class Box:
@@ -397,7 +403,7 @@ def layout(boxes):
                 else (halfw + SIDE_GAP + b.w / 2)
             b.y = r.y + dy
         y += SECTION_GAP - GAP_Y
-    H = y + 70.0
+    H = y + 34.0 + 5 * 26.0 + 8.0  # 底部纵向图例(5 行)空间
     lo = min(b.left for b in boxes.values())
     hi = max(b.right for b in boxes.values())
     W = hi - lo + 2 * MARGIN
@@ -411,8 +417,8 @@ def elbow_pts(name, B):
     raise NotImplementedError  # 已由 route() 的 dropin/bypass 通吃, 保留占位
 
 
-def route(b0, b1, sa, ta, kind):
-    """正交折线路由: 同行横向直连; 跨行走行间通道; 旁路走组件外侧。不穿过组件。"""
+def route(b0, b1, sa, ta, kind, allboxes=None):
+    """正交折线路由: 同行横向直连; 跨行走行间通道; 旁路走组件外侧并动态避障。"""
     p0 = b0.anchor(*sa)
     p1 = b1.anchor(*ta)
     if kind is None:
@@ -438,10 +444,21 @@ def route(b0, b1, sa, ta, kind):
         return [p0, (p0[0], ym), (ex, ym), (ex, b1.top)]
     if kind.startswith("bypassL") or kind.startswith("bypassR"):
         off = float(kind.split(":")[1])
+        lo, hi = min(p0[1], p1[1]), max(p0[1], p1[1])
         if kind.startswith("bypassL"):
-            bx = min(b0.left, b1.left) - off
+            cands = [b0.left, b1.left]
+            if allboxes:
+                cands += [b.left for b in allboxes.values()
+                          if b is not b0 and b is not b1
+                          and lo - 2 < b.y < hi + 2]
+            bx = min(cands) - off
         else:
-            bx = max(b0.right, b1.right) + off
+            cands = [b0.right, b1.right]
+            if allboxes:
+                cands += [b.right for b in allboxes.values()
+                          if b is not b0 and b is not b1
+                          and lo - 2 < b.y < hi + 2]
+            bx = max(cands) + off
         return [p0, (bx, p0[1]), (bx, p1[1]), p1]
     return [p0, p1]
 
@@ -456,11 +473,12 @@ def draw_arrow(ax, p0, p1, dashed, zorder=2):
 
 
 def draw_gqa(ax, b):
-    """多头/GQA 示意: 上排 H=8 查询头, 下排 K=4 KV 头, 每个 KV 头连 2 个查询头。"""
+    """多头/GQA 示意: 上排 h_q 个查询头, 下排 h_k 个 KV 头,
+    每个 KV 头被 h_q/h_k 个查询头共享。"""
     ax.add_patch(Rectangle((b.left, b.top), b.w, b.h, facecolor="#ffffff",
                            edgecolor=STROKE, lw=1.0, linestyle=(0, (4, 3))))
-    ax.text(b.x, b.top + 14, "多头拆分与 GQA 分组（H=8, K=4）", fontsize=10.5,
-            color=TXT, ha="center", va="center", fontweight="bold")
+    ax.text(b.x, b.top + 14, r"多头拆分与 GQA 分组（$h_q$ = 8, $h_k$ = 4）",
+            fontsize=10.5, color=TXT, ha="center", va="center", fontweight="bold")
     gw, gh, gp = 38.0, 17.0, 7.0
     row1_y = b.top + 46
     row2_y = b.top + 98
@@ -489,15 +507,15 @@ def draw_gqa(ax, b):
             ax.annotate("", xy=(qx[j], row1_y + gh + 1), xytext=(kx[i], row2_y - 1),
                         arrowprops=dict(arrowstyle="-|>", color=ARROW, lw=0.8,
                                         shrinkA=0, shrinkB=0, mutation_scale=8))
-    ax.text(b.x - total / 2, row1_y - 10, "查询头 ×H=8（每头 d 维）", fontsize=9,
-            ha="left", va="bottom")
-    ax.text(b.x - total / 2, row2_y - 10, "KV 头 ×K=4", fontsize=9,
-            ha="left", va="bottom")
+    ax.text(b.x - total / 2, row1_y - 10, r"查询头 ×$h_q$ = 8（每头 $d_q$ 维）",
+            fontsize=9, ha="left", va="bottom")
+    ax.text(b.x - total / 2, row2_y - 10, r"KV 头 ×$h_k$ = 4（每头 $d_k$ 维）",
+            fontsize=9, ha="left", va="bottom")
     ax.text(b.x, b.bottom - 26,
-            r"$N_{rep} = H \div K = 2$: 每 2 个查询头共享 1 组 KV",
+            r"$h_q \,/\, h_k = 8/4 = 2$：每 2 个查询头共享 1 组 KV",
             fontsize=9.5, ha="center", va="center")
     ax.text(b.x, b.bottom - 10,
-            "q_norm/k_norm/RoPE 逐头独立; scores 对 H 个头并行独立, 输出 concat",
+            r"q_norm/k_norm/RoPE 逐头独立; scores 对 $h_q$ 个头并行独立, 输出按头 concat",
             fontsize=9, ha="center", va="center")
 
 
@@ -513,13 +531,13 @@ def draw(fig, ax, boxes, W, H, titles):
     y1 = max(b.bottom for b in bl) + 26
     ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor="none",
                            edgecolor="#999999", lw=1.1, linestyle=(0, (5, 4)), zorder=0))
-    ax.text(x1 - 8, y0 + 14, "MiniMindBlock × N（num_hidden_layers = 8）",
+    ax.text(x1 - 8, y0 + 14, "MiniMindBlock × $N_{trans}$（num_hidden_layers = 8）",
             fontsize=10, color="#555555", ha="right", va="center")
 
     # ---- 连线层（zorder=2, 在组件之下; 正交折线, 不穿组件） ----
     for (s, t, dashed, sa, ta, label, kind) in EDGES:
         pts = route(boxes[s], boxes[t], sa or ("bottom", 0.5),
-                    ta or ("top", 0.5), kind)
+                    ta or ("top", 0.5), kind, allboxes=boxes)
         color = DASHC if dashed else ARROW
         ax.add_line(Line2D([p[0] for p in pts], [p[1] for p in pts], color=color,
                            lw=1.2, zorder=2,
@@ -568,29 +586,33 @@ def draw(fig, ax, boxes, W, H, titles):
         ax.text(MARGIN, ty, t, fontsize=12.5, color="#333333",
                 ha="left", va="center", fontweight="bold")
 
-    ly = H - 34
+    # 底部图例: 纵向逐行, 每行一个条目
+    legend_items = [
+        ("para", "网络结构块（模块 / 参数 / 算子）"),
+        ("rect", "激活值（张量）"),
+        ("circ", "逐元素算子（⊕ 残差 / × 门控 / Σ 累加）"),
+        ("solid", "前向数据流（实线; 箭头 = 张量流动方向）"),
+        ("dash", "条件路径（虚线; 推理缓存 / 可选输入 / 层循环 / MoE 替换）"),
+    ]
+    row_h = 26.0
+    ly = H - 34 - (len(legend_items) - 1) * row_h  # 首行 y
     lx = MARGIN
-    renderer = fig.canvas.get_renderer()
-    ax.add_patch(Polygon([(lx + 7, ly - 9), (lx + 46, ly - 9),
-                          (lx + 39, ly + 9), (lx, ly + 9)], closed=True,
-                         facecolor=FILL_STRUCT, edgecolor=STROKE, lw=1.0))
-    t1 = ax.text(lx + 54, ly, "网络结构块（模块 / 参数 / 算子）", fontsize=9.5, va="center")
-    lx += 54 + t1.get_window_extent(renderer).width / fig.dpi + 28
-    ax.add_patch(Rectangle((lx, ly - 9), 46, 18, facecolor=FILL_TENSOR,
-                           edgecolor=STROKE, lw=1.0))
-    t2 = ax.text(lx + 54, ly, "激活值（张量）", fontsize=9.5, va="center")
-    lx += 54 + t2.get_window_extent(renderer).width / fig.dpi + 28
-    ax.add_patch(Circle((lx + 12, ly), 11, facecolor=FILL_TENSOR,
-                        edgecolor=STROKE, lw=1.0))
-    ax.text(lx + 12, ly, "+", fontsize=11, ha="center", va="center")
-    t3 = ax.text(lx + 30, ly, "逐元素算子（⊕残差 / ×门控 / Σ累加）", fontsize=9.5, va="center")
-    lx += 30 + t3.get_window_extent(renderer).width / fig.dpi + 28
-    draw_arrow(ax, (lx, ly), (lx + 46, ly), 0)
-    t4 = ax.text(lx + 54, ly, "前向数据流", fontsize=9.5, va="center")
-    lx += 54 + t4.get_window_extent(renderer).width / fig.dpi + 28
-    draw_arrow(ax, (lx, ly), (lx + 46, ly), 1)
-    ax.text(lx + 54, ly, "条件路径（缓存 / 可选输入 / 层循环 / MoE 替换）", fontsize=9.5,
-            va="center")
+    for i, (kind, text) in enumerate(legend_items):
+        y_i = ly + i * row_h
+        if kind == "para":
+            ax.add_patch(Polygon([(lx + 7, y_i - 9), (lx + 46, y_i - 9),
+                                  (lx + 39, y_i + 9), (lx, y_i + 9)], closed=True,
+                                 facecolor=FILL_STRUCT, edgecolor=STROKE, lw=1.0))
+        elif kind == "rect":
+            ax.add_patch(Rectangle((lx, y_i - 9), 46, 18, facecolor=FILL_TENSOR,
+                                   edgecolor=STROKE, lw=1.0))
+        elif kind == "circ":
+            ax.add_patch(Circle((lx + 10, y_i), 10, facecolor=FILL_TENSOR,
+                                edgecolor=STROKE, lw=1.0))
+            ax.text(lx + 10, y_i, "+", fontsize=10, ha="center", va="center")
+        else:
+            draw_arrow(ax, (lx, y_i), (lx + 46, y_i), 1 if kind == "dash" else 0)
+        ax.text(lx + 56, y_i, text, fontsize=9.5, va="center")
 
 
 # ============================================================ HTML（可拖动版）
@@ -618,6 +640,22 @@ HTML_TMPL = """<!DOCTYPE html>
  .node.circ{border-radius:50%;width:26px;height:26px;padding:0;line-height:24px;
             font-size:14px;font-weight:bold}
  .sec{position:absolute;font-size:14px;color:#333;margin:0;white-space:nowrap;font-weight:bold}
+ #legend{position:fixed;right:12px;bottom:12px;background:rgba(255,255,255,.96);
+         border:1px solid #ccc;padding:10px 14px;font-size:12px;z-index:8;
+         box-shadow:0 0 6px rgba(0,0,0,.12);line-height:1}
+ .lg{display:flex;align-items:center;gap:10px;height:24px}
+ .lg .shape{display:inline-block;flex:0 0 34px}
+ .lg-para{transform:skewX(-14deg);background:#e8e8e8;border:1px solid #333;height:16px}
+ .lg-rect{background:#fff;border:1.2px solid #333;height:16px}
+ .lg-circ{position:relative;height:16px}
+ .lg-circ::before{content:'';position:absolute;left:0;top:0;width:16px;height:16px;
+                  border-radius:50%;background:#fff;border:1.2px solid #333;
+                  box-sizing:border-box}
+ .lg-line{position:relative;height:2px;background:#444}
+ .lg-line.dash{background:repeating-linear-gradient(90deg,#777 0 5px,transparent 5px 8px)}
+ .lg-line::after{content:'';position:absolute;right:-1px;top:-3px;
+                 border:4px solid transparent;border-left:6px solid #444}
+ .lg-line.dash::after{border-left-color:#777}
  .hnd{fill:#666;opacity:.3;cursor:move;pointer-events:auto}
  .hnd:hover{opacity:1}
 </style>
@@ -629,6 +667,13 @@ HTML_TMPL = """<!DOCTYPE html>
   <span style="color:#888">公式由 KaTeX 渲染（需联网）</span>
 </div>
 <div id="canvas"><svg id="edges"></svg></div>
+<div id="legend">
+ <div class="lg"><span class="shape lg-para"></span><span>网络结构块（模块 / 参数 / 算子）</span></div>
+ <div class="lg"><span class="shape lg-rect"></span><span>激活值（张量）</span></div>
+ <div class="lg"><span class="shape lg-circ"></span><span>逐元素算子（⊕ 残差 / × 门控 / Σ 累加）</span></div>
+ <div class="lg"><span class="shape lg-line"></span><span>前向数据流（实线; 箭头 = 张量流动方向）</span></div>
+ <div class="lg"><span class="shape lg-line dash"></span><span>条件路径（虚线; 推理缓存 / 可选输入 / 层循环 / MoE 替换）</span></div>
+</div>
 <script>
 const DATA = %%DATA%%;
 const cv = document.getElementById('canvas'), eg = document.getElementById('edges');
@@ -732,9 +777,21 @@ function routePts(e){
   if(kind.startsWith('bypass')){
     const off=parseFloat(kind.split(':')[1]);
     const s0=sizeOf(e.s), s1=sizeOf(e.t), n0=nodes[e.s], n1=nodes[e.t];
-    const bx=kind.startsWith('bypassL')
-      ? Math.min(n0.x-s0.w/2, n1.x-s1.w/2)-off
-      : Math.max(n0.x+s0.w/2, n1.x+s1.w/2)+off;
+    const lo=Math.min(p0[1],p1[1]), hi=Math.max(p0[1],p1[1]);
+    let bx;
+    if(kind.startsWith('bypassL')){
+      const cands=[n0.x-s0.w/2, n1.x-s1.w/2];
+      for (const id in nodes){ if(id===e.s||id===e.t)continue;
+        const s=sizeOf(id), n=nodes[id];
+        if (lo-2 < n.y && n.y < hi+2) cands.push(n.x-s.w/2); }
+      bx=Math.min(...cands)-off;
+    } else {
+      const cands=[n0.x+s0.w/2, n1.x+s1.w/2];
+      for (const id in nodes){ if(id===e.s||id===e.t)continue;
+        const s=sizeOf(id), n=nodes[id];
+        if (lo-2 < n.y && n.y < hi+2) cands.push(n.x+s.w/2); }
+      bx=Math.max(...cands)+off;
+    }
     return [p0,[bx,p0[1]],[bx,p1[1]],p1];
   }
   return [p0,p1];
@@ -840,13 +897,12 @@ setTimeout(resetLayout, 500);
 
 def write_html(path):
     gqa_text = ("para", [
-        "多头拆分与 GQA 分组（H=8, K=4）",
-        r"查询头 $h_1 \\dots h_8$（×H=8, 每头 d 维）",
-        r"KV 头 $kv_1 \\dots kv_4$（×K=4）",
-        r"$N_{rep} = H \\div K = 2$: 每 2 个查询头共享 1 组 KV",
-        "q_norm/k_norm/RoPE 逐头独立;",
-        "scores 对 H 个头并行独立,",
-        "输出 concat",
+        "多头拆分与 GQA 分组（$h_q$ = 8, $h_k$ = 4）",
+        "查询头 $h_1 \\dots h_8$（共 $h_q$ = 8 个, 每头 $d_q$ 维）",
+        "KV 头 $kv_1 \\dots kv_4$（共 $h_k$ = 4 个, 每头 $d_k$ 维）",
+        "每个 KV 头被 $h_q/h_k$ = 2 个查询头共享",
+        "q_norm / k_norm / RoPE 逐头独立;",
+        "scores 对 $h_q$ 个头并行独立, 输出按头 concat",
     ])
     nodes_data = {**{nid: {"shape": sh, "lines": lines}
                      for nid, (sh, lines) in NODES.items() if sh != "gqa"},

@@ -3,7 +3,6 @@ __pycache__/
 .DS_Store
 out
 website/
-docs-minimind/
 .idea/
 .venv/
 checkpoints/
