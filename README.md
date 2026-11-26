@@ -72,6 +72,39 @@
 
 ---
 
+## ❤️ 赞助
+
+<div align="center">
+
+<table>
+  <tr>
+    <td align="center" width="76">
+      <a href="https://www.infistar.cc/register?aff=VCHAAHCH&ref_source=link">
+        <img src="https://infistar.cc/logo.png" width="48" alt="无限星河AI" />
+      </a>
+    </td>
+    <td>
+      <b>MiniMind × <a href="https://www.infistar.cc/register?aff=VCHAAHCH&ref_source=link">Infistar.cc</a></b>：Claude、GPT、Gemini、DeepSeek等200+模型一个Key搞定，低至官方0.1折（省99%），100%官方纯血可验真，千条线路自动切换。通过<a href="https://www.infistar.cc/register?aff=VCHAAHCH&ref_source=link"><b>专属链接</b></a>注册即送¥5。
+    </td>
+  </tr>
+</table>
+
+</div>
+
+<details>
+<summary>关于赞助与合作</summary>
+<br>
+
+MiniMind 以 Apache 2.0 协议完全开源、永久免费。赞助完全自愿，不换取任何特权，也不影响项目使用。感谢每一位支持者，让这个业余时间维护的项目得以持续。
+
+赞助方式包括按月占位，或直接赞助 GPU 服务器（算力可能用于项目相关或不相关的研究性探索）。
+
+如有意向，欢迎通过 [邮件](mailto:gongjy.cs@foxmail.com) 联系。
+
+</details>
+
+---
+
 # 📌 项目介绍
 
 大语言模型（Large Language Model, LLM）的出现，引发了全球范围内对 AI 的空前关注。无论是 ChatGPT、DeepSeek 还是 Qwen，都以惊艳的效果让人真切感受到这场技术浪潮的冲击力。然而，动辄数百亿参数的模型规模，使得它们对个人设备而言不仅难以训练，甚至连部署都显得遥不可及。打开大模型的“黑盒子”，真正去理解其内部运作机制，本应是一件令人心潮澎湃的事。遗憾的是，绝大多数探索最终都止步于使用 LoRA 等技术对现有大模型做少量微调，学习一些新指令或特定任务。这更像是在教牛顿如何使用 21 世纪的智能手机——虽然有趣，却偏离了理解物理本质的初衷。
@@ -1153,7 +1186,9 @@ python train_grpo.py
 
 > MiniMind 在 GRPO 训练阶段的优化走势
 
-从训练曲线可以看出，GRPO的**reward呈现更加稳定的上升趋势**，达到4左右，说明GRPO本身能更好地利用RLAIF信号。Policy Loss整体下降平稳，相比PPO的双网络优化，GRPO单网络架构训练更稳定且收敛上限更高。
+从训练曲线可以看出，GRPO的**reward呈现更加稳定的上升趋势**，达到4左右，说明GRPO本身能更好地利用RLAIF信号。相比PPO的双网络优化，GRPO单网络架构训练更稳定且收敛上限更高。
+
+需要说明的是，Policy Loss 并不是监督学习里那种“越低越好”的 loss：它是按一阶导等于策略梯度构造的代理目标（TRPO like），并且每一轮都会做组内优势归一化，因此它的绝对值主要取决于当前策略与采样分布的偏离程度，“整体下降平稳”并不等于模型在变好。判断 GRPO 是否收敛，应该看 reward 和实际生成质量。
 
 #### 7.3 [Clipped Importance Sampling Policy Optimization](https://huggingface.co/papers/2506.13585)
 

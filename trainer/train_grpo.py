@@ -37,19 +37,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoModel
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import RLAIFDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
+from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel, rep_penalty, resolve_dtype
 from trainer.rollout_engine import create_rollout_engine
 
 warnings.filterwarnings('ignore')
-
-
-# 文本重复惩罚，返回 [0,cap] 标量，作为奖励扣分而非生成时 logits 惩罚。
-# 用正则拆词/标点后统计重复 n-gram（连续 n 个片段）；不是分词器 token。
-# 中文连续字串可能是一个正则片段；无足够片段时返回 0，无梯度。
-def rep_penalty(text, n=3, cap=0.5):
-    toks = re.findall(r"\w+|[^\w\s]", text.lower())
-    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
-    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 
 # 输入提示与生成回答，返回设备上的一维奖励张量；评分过程 no_grad。
@@ -258,7 +249,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=3e-7, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=0 if os.name == 'nt' else 8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=1, help="日志打印间隔")
@@ -304,7 +295,8 @@ if __name__ == "__main__":
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+    device_type = "cuda" if torch.device(args.device).type == "cuda" else "cpu"
+    args.dtype = resolve_dtype(args.dtype, args.device)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     # 自动混合精度（Automatic Mixed Precision）按算子选择 dtype；CPU 使用空上下文。
     # 本强化学习循环直接 backward，没有基础训练脚本的 GradScaler 梯度缩放。

@@ -8,6 +8,7 @@
 # RoPE（Rotary Position Embedding，旋转位置编码）给注意力注入位置；改变位置表不保证长文本质量。
 # temperature 以 logits/温度调分布尖锐程度，top-p 保留累计概率达到阈值的候选再采样。
 # eval 关闭训练态随机失活，no_grad/inference_mode 关闭梯度记录；二者分别控制不同事情。
+import os
 import time
 import argparse
 import random
@@ -27,7 +28,7 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     # 原生分支由 CLI 构造 config，再 strict=True 加载；层数/宽度/MoE 或词表不匹配会报错。
     # LoRA 若启用，需先注入同结构再加载 A/B；不是读取适配器就能替代基模。
-    if 'model' in args.load_from:
+    if os.path.basename(os.path.normpath(args.load_from)) == 'model':
         model = MiniMindForCausalLM(MiniMindConfig(
             hidden_size=args.hidden_size,
             num_hidden_layers=args.num_hidden_layers,
@@ -38,12 +39,13 @@ def init_model(args):
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         if args.lora_weight != 'None':
-            apply_lora(model)
+            apply_lora(model, rank=args.lora_rank)
             load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
-    return model.half().eval().to(args.device), tokenizer
+    if torch.device(args.device).type == 'cuda': model = model.half()
+    return model.eval().to(args.device), tokenizer
 
 # 解析 CLI、加载模型，循环生成并追加 assistant 回答；返回 None，打印输出。
 # 预训练模式拼 BOS+裸问题，对话模式套模板；随机种子每问重新随机选择。
@@ -55,6 +57,7 @@ def main():
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
+    parser.add_argument('--lora_rank', default=16, type=int, help="LoRA rank，需与训练时一致（默认16）")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")

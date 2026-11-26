@@ -76,7 +76,7 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     # 原生分支由 CLI 构造 config，再 strict=True 加载；层数/宽度/MoE 或词表不匹配会报错。
     # 此脚本未提供 LoRA 注入/加载选项；这里只加载普通原生或 Transformers 模型。
-    if 'model' in args.load_from:
+    if os.path.basename(os.path.normpath(args.load_from)) == 'model':
         model = MiniMindForCausalLM(MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)))
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
@@ -84,7 +84,8 @@ def init_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
-    return model.half().eval().to(args.device), tokenizer
+    if torch.device(args.device).type == 'cuda': model = model.half()
+    return model.eval().to(args.device), tokenizer
 
 
 # 提取完整标签中的 JSON 调用列表，坏 JSON 跳过；用于本地生成文本。

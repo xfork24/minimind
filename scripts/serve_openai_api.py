@@ -43,7 +43,7 @@ def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     # 原生分支由 CLI 构造 config，再 strict=True 加载；层数/宽度/MoE 或词表不匹配会报错。
     # LoRA 若启用，需先注入同结构再加载 A/B；不是读取适配器就能替代基模。
-    if 'model' in args.load_from:
+    if os.path.basename(os.path.normpath(args.load_from)) == 'model':
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'../{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model = MiniMindForCausalLM(MiniMindConfig(
@@ -55,12 +55,13 @@ def init_model(args):
         ))
         model.load_state_dict(torch.load(ckp, map_location=device), strict=True)
         if args.lora_weight != 'None':
-            apply_lora(model)
+            apply_lora(model, rank=args.lora_rank)
             load_lora(model, f'../{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)')
-    return model.half().eval().to(device), tokenizer
+    if torch.device(device).type == 'cuda': model = model.half()
+    return model.eval().to(device), tokenizer
 
 
 # Pydantic 请求模型，对基础字段解析与默认值赋值；messages/tools 内部仅声明为 list。
@@ -68,7 +69,7 @@ def init_model(args):
 class ChatRequest(BaseModel):
     model: str
     messages: list
-    temperature: float = 0.7
+    temperature: float = Field(default=0.7, ge=0.0, allow_inf_nan=False)
     top_p: float = 0.92
     max_tokens: int = 8192
     stream: bool = True
@@ -150,7 +151,7 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
                 model.generate(
                     inputs.input_ids,
                     max_new_tokens=max_tokens,
-                    do_sample=True,
+                    do_sample=temperature > 0,
                     temperature=temperature,
                     top_p=top_p,
                     attention_mask=inputs.attention_mask,
@@ -164,9 +165,11 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
 
         Thread(target=_generate).start()
 
-        full_text = ""
-        emitted = 0
+        pending = ""
+        in_tool_call = False
+        tool_count = 0
         thinking_ended = not bool(open_thinking)
+        strip_newlines = False
 
         while True:
             text = queue.get()
@@ -175,39 +178,57 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
             if isinstance(text, dict):
                 yield json.dumps(text, ensure_ascii=False)
                 continue
-            full_text += text
+            pending += text
 
-            if not thinking_ended:
-                # 寻找完整 </think> 后切换字段；检测前会立即发送所有未发字符。
-                # 结束标签若跨片段到达，前半标签可能已作为思考增量发出，非完整标签缓存解析器。
-                pos = full_text.find('</think>')
-                if pos >= 0:
-                    thinking_ended = True
-                    new_r = full_text[emitted:pos]
-                    if new_r:
-                        yield json.dumps({"choices": [{"delta": {"reasoning_content": new_r}}]}, ensure_ascii=False)
-                    emitted = pos + len('</think>')
-                    after = full_text[emitted:].lstrip('\n')
-                    emitted = len(full_text) - len(after)
-                    if after:
-                        yield json.dumps({"choices": [{"delta": {"content": after}}]}, ensure_ascii=False)
-                        emitted = len(full_text)
+            while pending:
+                if strip_newlines:
+                    pending = pending.lstrip('\n')
+                    if not pending:
+                        break
+                    strip_newlines = False
+                if in_tool_call:
+                    end = pending.find('</tool_call>')
+                    if end < 0:
+                        break
+                    end += len('</tool_call>')
+                    block, pending = pending[:end], pending[end:]
+                    _, _, tool_calls = parse_response(block)
+                    if tool_calls:
+                        call = tool_calls[0]
+                        call['index'] = tool_count
+                        call['id'] = f"call_{int(time.time())}_{tool_count}"
+                        tool_count += 1
+                        yield json.dumps({"choices": [{"delta": {"tool_calls": [call]}}]}, ensure_ascii=False)
+                    else:
+                        yield json.dumps({"choices": [{"delta": {"content": block}}]}, ensure_ascii=False)
+                    in_tool_call = False
+                    continue
+
+                marker = '<tool_call>' if thinking_ended else '</think>'
+                field = 'content' if thinking_ended else 'reasoning_content'
+                pos = pending.find(marker)
+                if pos < 0:
+                    keep = next((n for n in range(len(marker) - 1, 0, -1)
+                                 if pending.endswith(marker[:n])), 0)
+                    end = len(pending) - keep
+                    if end:
+                        yield json.dumps({"choices": [{"delta": {field: pending[:end]}}]}, ensure_ascii=False)
+                        pending = pending[end:]
+                    break
+                if pos:
+                    yield json.dumps({"choices": [{"delta": {field: pending[:pos]}}]}, ensure_ascii=False)
+                pending = pending[pos:]
+                if thinking_ended:
+                    in_tool_call = True
                 else:
-                    new_r = full_text[emitted:]
-                    if new_r:
-                        yield json.dumps({"choices": [{"delta": {"reasoning_content": new_r}}]}, ensure_ascii=False)
-                        emitted = len(full_text)
-            else:
-                new_c = full_text[emitted:]
-                if new_c:
-                    yield json.dumps({"choices": [{"delta": {"content": new_c}}]}, ensure_ascii=False)
-                    emitted = len(full_text)
+                    pending = pending[len(marker):]
+                    thinking_ended = True
+                    strip_newlines = True
 
-        # 普通文本可能已经流出工具标签；结束时再附结构化调用，不等于只发送其中一种格式。
-        _, _, tool_calls = parse_response(full_text)
-        if tool_calls:
-            yield json.dumps({"choices": [{"delta": {"tool_calls": tool_calls}}]}, ensure_ascii=False)
-        yield json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls" if tool_calls else "stop"}]}, ensure_ascii=False)
+        if pending:
+            field = 'content' if thinking_ended else 'reasoning_content'
+            yield json.dumps({"choices": [{"delta": {field: pending}}]}, ensure_ascii=False)
+        yield json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls" if tool_count else "stop"}]}, ensure_ascii=False)
 
     except Exception as e:
         yield json.dumps({"error": str(e)})
@@ -217,7 +238,7 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
 # 非流式 no_grad，切掉提示 IDs，再拆 thinking/tools；异常转 HTTPException。
 # async 声明不意味着同步模型计算自动不阻塞事件循环；此例未做并发隔离。
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+def chat_completions(request: ChatRequest):
     try:
         if request.stream:
             return StreamingResponse(
@@ -247,7 +268,7 @@ async def chat_completions(request: ChatRequest):
                 generated_ids = model.generate(
                     inputs["input_ids"],
                     max_new_tokens=request.max_tokens,
-                    do_sample=True,
+                    do_sample=request.temperature > 0,
                     attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
@@ -284,6 +305,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
     parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, dpo, reason, ppo_actor, grpo, spo）")
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
+    parser.add_argument('--lora_rank', default=16, type=int, help="LoRA rank，需与训练时一致（默认16）")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=8192, type=int, help="最大序列长度")

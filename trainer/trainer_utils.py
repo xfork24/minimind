@@ -15,6 +15,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import ast
 import operator
 import random
+import re
 import math
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 from model.model_minimind import MiniMindForCausalLM
 
+# ======== 模型参数量 ========
 # 打印总参数量与估计活跃参数量，单位百万；不返回计数对象。
 # 根据名字识别第 0 专家并乘专家数，假设各专家等宽；不是逐 token 实测 FLOPs。
 def get_model_params(model, config):
@@ -43,24 +45,43 @@ def get_model_params(model, config):
     else: Logger(f'Model Params: {total:.2f}M')
 
 
+# ======== 主进程判断 ========
 # 未初始化分布式或 rank=0 时返回 True；rank 是全局进程编号。
 # 用于避免多进程重复日志/保存，不表示其他进程停止训练。
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
+# ======== 日志 ========
 # 接收可打印 content，仅主进程 print；不写日志文件，也无返回值。
 def Logger(content):
     if is_main_process():
         print(content)
 
 
-# 返回余弦衰减 lr*(0.1+0.45*(1+cos(pi*step/total)))。
-# step=0 得 lr，step=total 得 0.1*lr；无 warmup，total_steps 须非零。
-def get_lr(current_step, total_steps, lr):
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+# ======== 混合精度类型 ========
+def resolve_dtype(dtype, device):
+    if dtype != "bfloat16" or not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        return dtype
+    if torch.cuda.is_bf16_supported(including_emulation=False):
+        return dtype
+    Logger(f"{torch.cuda.get_device_name(device)} 不原生支持 bfloat16，已回退为 float16")
+    return "float16"
 
 
+# ======== 学习率 ========
+# 余弦衰减 lr*(0.1+0.45*(1+cos))，step=total 时降至 0.1*lr；
+# warmup_ratio>0 时前 warmup 步线性升温（步数从 1 开始计）；total_steps 须非零。
+def get_lr(current_step, total_steps, lr, warmup_ratio=0.0):
+    warmup = max(1, int(warmup_ratio * total_steps)) if warmup_ratio > 0 else 0
+    # Training loops pass one-based steps; step 0 is before the first update.
+    if warmup > 0 and current_step <= warmup:
+        return lr * current_step / warmup
+    angle = math.pi * (current_step - warmup) / max(1, total_steps - warmup)
+    return lr * (0.1 + 0.45 * (1 + math.cos(angle)))
+
+
+# ======== 分布式初始化 ========
 # 以环境 RANK 判断 torchrun 模式，初始化 NCCL 并选 LOCAL_RANK 对应 GPU。
 # 返回本机卡号；单进程返回 0，不创建进程组；NCCL 路径要求 CUDA。
 def init_distributed_mode():
@@ -73,6 +94,7 @@ def init_distributed_mode():
     return local_rank
 
 
+# ======== 随机种子 ========
 # 设置 Python、NumPy、PyTorch 与 CUDA 随机种子，并切换 cuDNN 确定性选项。
 # 影响初始化、打乱及采样；不同设备/算子/并行次序仍可能有数值差异。
 def setup_seed(seed: int):
@@ -84,6 +106,8 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+# ======== 断点保存与续训 ========
 # 双模式：model 非空时保存权重及 _resume.pth，空时尝试加载后返回字典/None。
 # 保存优化器、epoch/step、world_size、记录平台 id 及 kwargs 中额外状态。
 # 未保存全部 RNG（随机数生成器）状态、采样引擎状态或未更新的累积梯度，
@@ -97,12 +121,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
     if model is not None:
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
         raw_model = getattr(raw_model, '_orig_mod', raw_model)
-        state_dict = raw_model.state_dict()
-        state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-        # 先写同目录临时文件再 os.replace，避免读取半写文件；两份文件不是整体事务。
-        # 权重转 CPU float16 会舍入，resume 的 model 也使用该半精度字典。
+        state_dict = {k: v.cpu() for k, v in raw_model.state_dict().items()}
         ckp_tmp = ckp_path + '.tmp'
-        torch.save(state_dict, ckp_tmp)
+        torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
         wandb_id = None
         if wandb:
@@ -150,6 +171,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
+# ======== 模型初始化 ========
 # 按配置创建原生模型并加载 from_weight 前缀权重，返回 (设备上的模型,分词器)。
 # none 跳过加载；strict=False 允许缺/多键，但同名张量尺寸不符仍可报错。
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
@@ -167,6 +189,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     return model.to(device), tokenizer
 
 
+# ======== 跳过批次采样器 ========
 # 将索引流组为批次，跳过已完成批次数，使续训不重新消费前部数据。
 # 只跳索引，不恢复 Python/worker 中随机增强的内部状态。
 class SkipBatchSampler(Sampler):
@@ -201,6 +224,7 @@ class SkipBatchSampler(Sampler):
         return max(0, total_batches - self.skip_batches)
 
 
+# ======== 奖励模型 ========
 # 奖励模型适配器，将对话与回答映射为标量质量分。
 # 它不是策略网络；只提供评分，无反向更新接口。
 class LMForRewardModel:
@@ -227,6 +251,7 @@ class LMForRewardModel:
         return max(min(score, 3.0), -3.0)
 
 
+# ======== 数学表达式安全求值 ========
 # ===== 数学表达式安全求值：替代 eval，只放行算术运算与 math 白名单（长度上限 512） =====
 # 把表达式解析为 AST（抽象语法树），递归解释白名单运算而非 Python eval。
 # 返回数值或抛异常；长度上限 512，拒绝字符串、任意属性及非白名单调用。
@@ -265,3 +290,12 @@ def safe_math_eval(expression):
         return walk(ast.parse(expr, mode='eval').body)
     except (KeyError, SyntaxError, TypeError):
         raise ValueError('不支持的表达式语法') from None
+
+
+# ======== 重复惩罚 ========
+def rep_penalty(text, n=3, cap=0.5):
+    cjk = ("\u3007\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af"
+           "\U00020000-\U0002ee5f\U0002f800-\U0002fa1f\U00030000-\U0003347f")
+    toks = re.findall(rf"[{cjk}]|[^\W{cjk}]+|[^\w\s]", text.lower())
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0

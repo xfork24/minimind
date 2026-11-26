@@ -218,7 +218,7 @@ class Attention(nn.Module):
             if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
             # [B,L] → [B,1,1,L] 广播至所有查询头；padding 列加 -1e9。
             # 这是可见性遮罩，不是 -100 标签；整行全被屏蔽的异常输入未单独处理。
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            if attention_mask is not None: scores += (1.0 - attention_mask.to(scores.dtype).unsqueeze(1).unsqueeze(2)) * -1e9
             output = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq)) @ xv
         # [B,H,T,d] 转回 [B,T,H,d] 再合并 H*d，O 投影回 D。
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
@@ -412,6 +412,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     # 缓存对应最后一次前向，通常尚未包含刚采出的最后一个 token，续写时需留意边界。
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
+        if do_sample and not 0 < temperature < math.inf: raise ValueError("Sampling temperature must be finite and positive")
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         # 输入与缓存独立传入；缓存不是生成 token 文本，也不替代完整上下文记录。
@@ -425,22 +426,21 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], -1) if attention_mask is not None else None
             # 尾位置预测下一 token；temperature<1 使分布尖锐，>1 更平坦。
             # logits 未归一化，不能直接当概率。
-            logits = outputs.logits[:, -1, :] / temperature
+            logits = outputs.logits[:, -1] / temperature if do_sample else outputs.logits[:, -1]
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     # 重复惩罚按符号缩放已出现 token 的分数：正数除 penalty，负数乘 penalty。
                     # penalty>1 时压低分数，0<penalty<1 时反而鼓励重复；penalty=1 不改变分数。
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            if top_k > 0: 
+            if do_sample and top_k > 0:
                 # top-k 仅保留分数最高的 k 个候选（阈值并列项也可能留下），其余置 -inf。
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
-            if top_p < 1.0:
+            if do_sample and top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
                 # 核采样（top-p）按概率降序累计；右移遮罩保留第一个跨越阈值的 token。
                 # clone 防止重叠切片原地赋值问题；scatter 将排序空间遮罩映射回词表编号。
-                mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
-                logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
+                logits[mask.scatter(1, sorted_indices, F.pad(mask[..., :-1], (1, 0)))] = -float('inf')
             # 采样按概率随机抽取，贪心取 argmax；两者都只生成一个新编号。
             # 已结束样本继续填 EOS，使批量形状一致；finished 的 |= 是原地累计结束状态。
             next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(logits, dim=-1, keepdim=True)
